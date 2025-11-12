@@ -1,0 +1,16 @@
+{
+  "name": "estudios-complementarios-api",
+  "version": "1.0.0",
+  "description": "Microservicio para buscar links de estudios complementarios por DNI en Google Sheets.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "google-spreadsheet": "^5.0.2"
+  }
+}
