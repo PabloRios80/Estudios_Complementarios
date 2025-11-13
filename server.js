@@ -27,20 +27,23 @@ if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL === "[PEGA AQUÍ LA URL COMPLETA DE TU W
 
 /**
  * Endpoint para buscar estudios complementarios usando la Web App de Apps Script.
- * La búsqueda se realiza en la hoja 'Pacientes II' a través del DNI.
+ * Acepta DNI y el TIPO de estudio ('laboratorio', 'mamografia', etc.) para una búsqueda específica.
  */
 app.get('/api/buscar-estudios', async (req, res) => {
     const dni = req.query.dni;
+    const tipo = req.query.tipo; // <-- NUEVO: Capturamos el tipo de estudio
     
-    if (!dni) {
-        return res.status(400).json({ error: "Parámetro 'dni' es requerido." });
+    // Verificación de parámetros: DNI y TIPO son ahora obligatorios
+    if (!dni || !tipo) {
+        return res.status(400).json({ error: "Parámetros 'dni' y 'tipo' son requeridos." });
     }
 
     try {
-        console.log(`Buscando estudio complementario para DNI: ${dni} a través de Apps Script...`);
+        console.log(`Buscando estudio complementario TIPO: ${tipo} para DNI: ${dni} a través de Apps Script...`);
 
-        // Construye el URL de la Web App con el parámetro 'dni'
-        const urlFinal = `${APPS_SCRIPT_URL}?dni=${dni}`;
+        // Construye el URL de la Web App con AMBOS parámetros 'dni' y 'tipo'
+        const urlFinal = `${APPS_SCRIPT_URL}?dni=${dni}&tipo=${tipo}`; // <-- URL final
+        console.log(`Llamando a: ${urlFinal}`);
 
         // Realiza la solicitud GET a la API de Apps Script
         const response = await axios.get(urlFinal);
@@ -51,7 +54,7 @@ app.get('/api/buscar-estudios', async (req, res) => {
 
         if (data.error && data.status === 404) {
              // Si Apps Script devuelve 404, indicamos que no hay datos
-             console.log(`➡️ 404: Estudios no encontrados para DNI ${dni}.`);
+             console.log(`➡️ 404: Estudios de ${tipo} no encontrados para DNI ${dni}.`);
              return res.status(404).json(data);
         }
 
@@ -61,7 +64,7 @@ app.get('/api/buscar-estudios', async (req, res) => {
             return res.status(data.status || 500).json({ error: data.error || "Error desconocido en Apps Script." });
         }
         
-        console.log(`➡️ Éxito: Encontrado el link de estudio para DNI ${dni}.`);
+        console.log(`➡️ Éxito: Encontrado el link de estudio ${tipo} para DNI ${dni}.`);
         res.json(data);
 
 
@@ -89,6 +92,6 @@ app.get('/api/buscar-estudios', async (req, res) => {
 app.listen(PORT, () => {
     console.log("-----------------------------------------------");
     console.log(`🎉 Microservicio de Estudios iniciado en el puerto: ${PORT}`);
-    console.log(`🌐 Endpoint de prueba: http://localhost:${PORT}/api/buscar-estudios?dni=TU_DNI`);
+    console.log(`🌐 Endpoint de prueba: http://localhost:${PORT}/api/buscar-estudios?dni=TU_DNI&tipo=laboratorio`);
     console.log("-----------------------------------------------");
 });
