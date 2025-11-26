@@ -54,8 +54,8 @@ app.get('/api/buscar-estudios', async (req, res) => {
 
         if (data.error && data.status === 404) {
              // Si Apps Script devuelve 404, indicamos que no hay datos
-             console.log(`➡️ 404: Estudios de ${tipo} no encontrados para DNI ${dni}.`);
-             return res.status(404).json(data);
+            console.log(`➡️ 404: Estudios de ${tipo} no encontrados para DNI ${dni}.`);
+            return res.status(404).json(data);
         }
 
         if (data.error || data.status >= 400) {
