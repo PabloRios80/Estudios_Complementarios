@@ -1,5 +1,8 @@
-// Microservicio de estudios complementarios — ahora lee directo de Supabase
-// en vez de proxyar a la Web App de Apps Script.
+// Microservicio de estudios complementarios — lee de Supabase.
+// Estrategia: primero busca en practicas_autorizadas (fuente nueva,
+// ligada a facturación SIOS — si está ahí, es el dato "oficial" que
+// también ve el PV y factura el prestador). Si no está ahí, cae a
+// practicas_historicas (datos migrados de Sheets, incluye ATEM viejo).
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
@@ -18,16 +21,26 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// El frontend usa 'ecomamaria' pero en la base el tipo_practica es 'eco_mamaria'.
-// Cualquier otro alias futuro se agrega acá.
-const ALIAS_TIPO = {
-    ecomamaria: 'eco_mamaria',
+// --- Mapeo tipo (frontend) -> codigo_prestacion en practicas_autorizadas ---
+const CODIGO_A_TIPO = {
+    '65007': 'mamografia',
+    '185087': 'ecomamaria',
+    '185086': 'ecografia',
+    '205011': 'vcc',
+    '285011': 'espirometria',
+    '155012': 'papanicolau',
+    '345099': 'densitometria',
 };
+const CODIGOS_LABORATORIO_EXTRA = ['B040103']; // "Práctica bioquímica"
+
+// --- Alias para el fallback en practicas_historicas (nombres viejos) ---
+const ALIAS_HISTORICO = { ecomamaria: 'eco_mamaria' };
+
+// Tipos que no tienen PDF: son fichas estructuradas en tablas propias.
+const TIPOS_FICHA = ['enfermeria'];
 
 function extraerLink(linkPdfCrudo) {
     if (!linkPdfCrudo) return null;
-    // A veces viene como string plano ("https://..."), a veces como texto
-    // que en realidad es un array JSON con un único link adentro.
     if (typeof linkPdfCrudo === 'string' && linkPdfCrudo.startsWith('http')) {
         return linkPdfCrudo;
     }
@@ -42,106 +55,176 @@ function extraerLink(linkPdfCrudo) {
 
 function formatFecha(fechaISO) {
     if (!fechaISO) return null;
-    const [y, m, d] = fechaISO.split('-');
+    const soloFecha = fechaISO.split('T')[0]; // por si viene con hora (timestamptz)
+    const [y, m, d] = soloFecha.split('-');
+    if (!y || !m || !d) return null;
     return `${d}/${m}/${y}`;
 }
 
+// Busca en practicas_autorizadas (fuente nueva, ligada a facturación).
+async function buscarEnAutorizadas(dniStr, tipo) {
+    let query = supabase
+        .from('practicas_autorizadas')
+        .select('enlace_pdf, fecha_carga')
+        .eq('dni', dniStr)
+        .eq('estado', 'REALIZADA')
+        .not('enlace_pdf', 'is', null);
+
+    if (tipo === 'laboratorio') {
+        const filtroExtra = CODIGOS_LABORATORIO_EXTRA.map(c => `codigo_prestacion.eq.${c}`).join(',');
+        query = query.or(`codigo_prestacion.like.679%,${filtroExtra}`);
+    } else {
+        const codigo = Object.keys(CODIGO_A_TIPO).find(c => CODIGO_A_TIPO[c] === tipo);
+        if (!codigo) return null; // este tipo todavía no tiene código mapeado acá
+        query = query.eq('codigo_prestacion', codigo);
+    }
+
+    const { data, error } = await query.order('fecha_carga', { ascending: false }).limit(1);
+    if (error) throw error;
+    if (!data || data.length === 0) return null;
+
+    const link = extraerLink(data[0].enlace_pdf);
+    if (!link) return null;
+    return { link, fechaResultado: formatFecha(data[0].fecha_carga) };
+}
+
+// Fallback: busca en practicas_historicas (datos migrados, incluye ATEM viejo).
+async function buscarEnHistoricas(dniStr, tipo) {
+    const tipoHistorico = ALIAS_HISTORICO[tipo] || tipo;
+    const { data, error } = await supabase
+        .from('practicas_historicas')
+        .select('link_pdf, fecha')
+        .eq('dni', dniStr)
+        .eq('tipo_practica', tipoHistorico)
+        .order('fecha', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+    if (error) throw error;
+    if (!data) return null;
+    const link = extraerLink(data.link_pdf);
+    if (!link) return null;
+    return { link, fechaResultado: formatFecha(data.fecha) };
+}
+
+async function buscarEnfermeria(dniStr) {
+    const { data, error } = await supabase
+        .from('enfermeria_consultas')
+        .select('nombre, apellido, dni, presion_arterial, agudeza_visual, peso_kg, altura_cm, circunferencia_cintura_cm, vacunas, nombre_enfermera, fecha_cierre_enf, created_at')
+        .eq('dni', dniStr)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+    if (error) throw error;
+    if (!data) return null;
+
+    const fecha = data.fecha_cierre_enf || formatFecha(data.created_at);
+    return {
+        datos: {
+            nombre: data.nombre,
+            apellido: data.apellido,
+            dni: data.dni,
+            presion: data.presion_arterial,
+            agudeza: data.agudeza_visual,
+            peso: data.peso_kg,
+            altura: data.altura_cm,
+            cintura: data.circunferencia_cintura_cm,
+            vacunas: data.vacunas,
+            enfermera: data.nombre_enfermera,
+            fecha,
+        },
+        fechaResultado: fecha,
+    };
+}
+
+async function buscarOdontologia(dniStr) {
+    const { data, error } = await supabase
+        .from('odontologia_consultas')
+        .select('enlace_pdf, fecha')
+        .eq('dni', dniStr)
+        .order('fecha', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+    if (error) throw error;
+    if (!data || !data.enlace_pdf) return null;
+    return { link: data.enlace_pdf, fechaResultado: formatFecha(data.fecha) };
+}
+
+// Punto único de búsqueda para un tipo de estudio: intenta autorizadas
+// primero, y si no hay nada, cae a historicas.
+async function buscarEstudioPorTipo(dniStr, tipoOriginal) {
+    const tipo = tipoOriginal;
+
+    if (TIPOS_FICHA.includes(tipo)) return buscarEnfermeria(dniStr);
+    if (tipo === 'odontologia') return buscarOdontologia(dniStr);
+
+    const enAutorizadas = await buscarEnAutorizadas(dniStr, tipo);
+    if (enAutorizadas) return enAutorizadas;
+
+    return buscarEnHistoricas(dniStr, tipo);
+}
+
+// --- Endpoint original: un tipo por pedido (se mantiene por compatibilidad) ---
 app.get('/api/buscar-estudios', async (req, res) => {
     const dni = req.query.dni;
-    const tipoOriginal = req.query.tipo;
+    const tipo = req.query.tipo;
 
-    if (!dni || !tipoOriginal) {
+    if (!dni || !tipo) {
         return res.status(400).json({ error: "Parámetros 'dni' y 'tipo' son requeridos." });
     }
 
-    const tipo = ALIAS_TIPO[tipoOriginal] || tipoOriginal;
-    console.log(`Buscando estudio TIPO: ${tipo} para DNI: ${dni} en Supabase...`);
+    const dniStr = String(dni).trim();
+    console.log(`Buscando estudio TIPO: ${tipo} para DNI: ${dniStr}...`);
 
     try {
-        // Enfermería no tiene PDF: es una ficha estructurada (peso, presión,
-        // agudeza visual, vacunas, etc.) que el frontend muestra en un modal.
-        if (tipo === 'enfermeria') {
-            const { data, error } = await supabase
-                .from('enfermeria_consultas')
-                .select('nombre, apellido, dni, presion_arterial, agudeza_visual, peso_kg, altura_cm, circunferencia_cintura_cm, vacunas, nombre_enfermera, fecha_cierre_enf, created_at')
-                .eq('dni', String(dni).trim())
-                .order('created_at', { ascending: false })
-                .limit(1)
-                .maybeSingle();
-
-            if (error) throw error;
-            if (!data) {
-                return res.status(404).json({ error: `No hay ficha de enfermería para DNI ${dni}.` });
-            }
-
-            const fecha = data.fecha_cierre_enf || formatFecha(data.created_at ? data.created_at.split('T')[0] : null);
-            const datos = {
-                nombre: data.nombre,
-                apellido: data.apellido,
-                dni: data.dni,
-                presion: data.presion_arterial,
-                agudeza: data.agudeza_visual,
-                peso: data.peso_kg,
-                altura: data.altura_cm,
-                cintura: data.circunferencia_cintura_cm,
-                vacunas: data.vacunas,
-                enfermera: data.nombre_enfermera,
-                fecha,
-            };
-            return res.json({ datos, fechaResultado: fecha });
+        const resultado = await buscarEstudioPorTipo(dniStr, tipo);
+        if (!resultado) {
+            console.log(`➡️ 404: ${tipo} no encontrado para DNI ${dniStr}.`);
+            return res.status(404).json({ error: `No se encontraron estudios de ${tipo} para DNI ${dniStr}.` });
         }
-
-        // Odontología vive en su propia tabla (fuente de verdad separada)
-        if (tipo === 'odontologia') {
-            const { data, error } = await supabase
-                .from('odontologia_consultas')
-                .select('enlace_pdf, fecha')
-                .eq('dni', String(dni).trim())
-                .order('fecha', { ascending: false })
-                .limit(1)
-                .maybeSingle();
-
-            if (error) throw error;
-            if (!data || !data.enlace_pdf) {
-                return res.status(404).json({ error: `No se encontraron estudios de odontología para DNI ${dni}.` });
-            }
-            return res.json({ link: data.enlace_pdf, fechaResultado: formatFecha(data.fecha) });
-        }
-
-        // Todo lo demás sale de practicas_historicas
-        const { data, error } = await supabase
-            .from('practicas_historicas')
-            .select('link_pdf, fecha')
-            .eq('dni', String(dni).trim())
-            .eq('tipo_practica', tipo)
-            .order('fecha', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-
-        if (error) throw error;
-
-        const link = data ? extraerLink(data.link_pdf) : null;
-
-        if (!link) {
-            console.log(`➡️ 404: Estudios de ${tipo} no encontrados para DNI ${dni}.`);
-            return res.status(404).json({ error: `No se encontraron estudios de ${tipo} para DNI ${dni}.` });
-        }
-
-        console.log(`➡️ Éxito: Encontrado el link de estudio ${tipo} para DNI ${dni}.`);
-        res.json({ link, fechaResultado: formatFecha(data.fecha) });
-
+        res.json(resultado);
     } catch (error) {
-        console.error(`🚨 ERROR consultando Supabase: ${error.message}`);
-        return res.status(500).json({
-            error: "Fallo al consultar la base de datos.",
-            details: error.message
-        });
+        console.error(`🚨 ERROR: ${error.message}`);
+        res.status(500).json({ error: 'Fallo al consultar la base de datos.', details: error.message });
+    }
+});
+
+// --- Endpoint consolidado: todos los tipos en un solo pedido ---
+const TODOS_LOS_TIPOS = ['laboratorio', 'mamografia', 'ecografia', 'ecomamaria',
+    'espirometria', 'enfermeria', 'densitometria', 'vcc', 'oftalmologia',
+    'odontologia', 'biopsia', 'papanicolau'];
+
+app.get('/api/buscar-estudios-completo', async (req, res) => {
+    const dni = req.query.dni;
+    if (!dni) return res.status(400).json({ error: "Parámetro 'dni' es requerido." });
+
+    const dniStr = String(dni).trim();
+    console.log(`Buscando TODOS los estudios para DNI: ${dniStr} (pedido único)`);
+
+    try {
+        const resultado = {};
+        await Promise.all(TODOS_LOS_TIPOS.map(async (tipo) => {
+            try {
+                const encontrado = await buscarEstudioPorTipo(dniStr, tipo);
+                if (encontrado) resultado[tipo] = encontrado;
+            } catch (e) {
+                console.error(`Error buscando ${tipo}:`, e.message);
+            }
+        }));
+
+        console.log(`➡️ Encontrados ${Object.keys(resultado).length} tipos de estudio para DNI ${dniStr}.`);
+        res.json(resultado);
+    } catch (error) {
+        console.error(`🚨 ERROR en buscar-estudios-completo: ${error.message}`);
+        res.status(500).json({ error: 'Fallo al consultar la base de datos.', details: error.message });
     }
 });
 
 app.listen(PORT, () => {
     console.log("-----------------------------------------------");
-    console.log(`🎉 Microservicio de Estudios (Supabase) iniciado en el puerto: ${PORT}`);
-    console.log(`🌐 Endpoint de prueba: http://localhost:${PORT}/api/buscar-estudios?dni=TU_DNI&tipo=laboratorio`);
+    console.log(`🎉 Microservicio de Estudios iniciado en el puerto: ${PORT}`);
+    console.log(`🌐 Prueba: http://localhost:${PORT}/api/buscar-estudios?dni=TU_DNI&tipo=laboratorio`);
     console.log("-----------------------------------------------");
 });
