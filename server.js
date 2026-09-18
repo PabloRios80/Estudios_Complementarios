@@ -62,30 +62,67 @@ function formatFecha(fechaISO) {
 }
 
 // Busca en practicas_autorizadas (fuente nueva, ligada a facturación).
-async function buscarEnAutorizadas(dniStr, tipo) {
-    let query = supabase
+// Para 'laboratorio' busca el panel general y SOMF por separado, porque
+// son dos PDFs distintos que pueden coexistir (SOMF cae en el mismo
+// rango de códigos 679xxx pero es un estudio aparte).
+async function buscarUnResultadoAutorizado(dniStr, codigos) {
+    const { data, error } = await supabase
         .from('practicas_autorizadas')
         .select('enlace_pdf, fecha_carga')
         .eq('dni', dniStr)
         .eq('estado', 'REALIZADA')
-        .not('enlace_pdf', 'is', null);
+        .not('enlace_pdf', 'is', null)
+        .in('codigo_prestacion', codigos)
+        .order('fecha_carga', { ascending: false })
+        .limit(1);
 
-    if (tipo === 'laboratorio') {
-        const filtroExtra = CODIGOS_LABORATORIO_EXTRA.map(c => `codigo_prestacion.eq.${c}`).join(',');
-        query = query.or(`codigo_prestacion.like.679%,${filtroExtra}`);
-    } else {
-        const codigo = Object.keys(CODIGO_A_TIPO).find(c => CODIGO_A_TIPO[c] === tipo);
-        if (!codigo) return null; // este tipo todavía no tiene código mapeado acá
-        query = query.eq('codigo_prestacion', codigo);
-    }
-
-    const { data, error } = await query.order('fecha_carga', { ascending: false }).limit(1);
     if (error) throw error;
     if (!data || data.length === 0) return null;
-
     const link = extraerLink(data[0].enlace_pdf);
     if (!link) return null;
-    return { link, fechaResultado: formatFecha(data[0].fecha_carga) };
+    return { link, fecha: data[0].fecha_carga };
+}
+
+const CODIGO_SOMF = '679905';
+
+async function buscarEnAutorizadas(dniStr, tipo) {
+    if (tipo === 'laboratorio') {
+        // Todos los códigos 679xxx conocidos, EXCEPTO SOMF, que va aparte.
+        const { data: codigosData, error: errCodigos } = await supabase
+            .from('practicas_autorizadas')
+            .select('codigo_prestacion')
+            .eq('dni', dniStr)
+            .eq('estado', 'REALIZADA')
+            .not('enlace_pdf', 'is', null)
+            .like('codigo_prestacion', '679%');
+        if (errCodigos) throw errCodigos;
+
+        const codigosPanel = [...new Set((codigosData || [])
+            .map(r => r.codigo_prestacion)
+            .filter(c => c !== CODIGO_SOMF))]
+            .concat(CODIGOS_LABORATORIO_EXTRA);
+
+        const panel = codigosPanel.length ? await buscarUnResultadoAutorizado(dniStr, codigosPanel) : null;
+        const somf = await buscarUnResultadoAutorizado(dniStr, [CODIGO_SOMF]);
+
+        if (!panel && !somf) return null;
+
+        return {
+            link: panel ? panel.link : (somf ? somf.link : null),
+            fechaResultado: formatFecha(panel ? panel.fecha : (somf ? somf.fecha : null)),
+            // Si hay panel Y somf con links distintos, sumamos el segundo.
+            ...(panel && somf && panel.link !== somf.link
+                ? { linkSomf: somf.link, fechaSomf: formatFecha(somf.fecha) }
+                : {}),
+        };
+    }
+
+    const codigo = Object.keys(CODIGO_A_TIPO).find(c => CODIGO_A_TIPO[c] === tipo);
+    if (!codigo) return null; // este tipo todavía no tiene código mapeado acá
+
+    const encontrado = await buscarUnResultadoAutorizado(dniStr, [codigo]);
+    if (!encontrado) return null;
+    return { link: encontrado.link, fechaResultado: formatFecha(encontrado.fecha) };
 }
 
 // Fallback: busca en practicas_historicas (datos migrados, incluye ATEM viejo).
